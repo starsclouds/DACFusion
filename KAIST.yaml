@@ -1,0 +1,9 @@
+train: /home/hjy/workspace/datasets/KAIST/visible/train/
+test: /home/hjy/workspace/datasets/KAIST/visible/test/
+val: /home/hjy/workspace/datasets/KAIST/visible/test/
+
+# number of classes
+nc: 1
+
+# class names
+names: ['person']

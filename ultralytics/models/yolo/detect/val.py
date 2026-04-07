@@ -109,6 +109,18 @@ class DetectionValidator(BaseValidator):
         self.jdict = []
         self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[])
 
+        self.is_kaist = isinstance(val, str) and "KAIST" in val
+        self.kaist_label_map = {}
+        self.kaist_results = []
+        if self.is_kaist:
+            labels_dir = val.replace(f"{os.sep}visible{os.sep}", f"{os.sep}labels{os.sep}")
+            if os.path.isdir(labels_dir):
+                labels_list = sorted(os.listdir(labels_dir))
+                self.kaist_label_map = {
+                    os.path.splitext(f)[0]: idx + 1 for idx, f in enumerate(labels_list)
+                }
+                LOGGER.info(f"KAIST MR evaluation enabled: {len(self.kaist_label_map)} images mapped")
+
     def get_desc(self):
         """Return a formatted string summarizing class metrics of YOLO model."""
         return ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")
@@ -190,6 +202,16 @@ class DetectionValidator(BaseValidator):
                 file = self.save_dir / "labels" / f'{Path(batch["im_file"][si]).stem}.txt'
                 self.save_one_txt(predn, self.args.save_conf, pbatch["ori_shape"], file)
 
+            # Accumulate KAIST MR predictions (pixel-space top-left xywh)
+            if self.is_kaist and self.kaist_label_map:
+                stem = Path(batch["im_file"][si]).stem
+                image_id = self.kaist_label_map.get(stem)
+                if image_id is not None:
+                    for *xyxy, conf, cls in predn.tolist():
+                        x_tl, y_tl = xyxy[0], xyxy[1]
+                        w, h = xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]
+                        self.kaist_results.append((image_id, x_tl, y_tl, w, h, conf))
+
     def finalize_metrics(self, *args, **kwargs):
         """Set final values for metrics speed and confusion matrix."""
         self.metrics.speed = self.speed
@@ -222,6 +244,54 @@ class DetectionValidator(BaseValidator):
                 self.confusion_matrix.plot(
                     save_dir=self.save_dir, names=self.names.values(), normalize=normalize, on_plot=self.on_plot
                 )
+
+        if self.is_kaist and self.kaist_results:
+            self.eval_kaist_mr()
+
+    def eval_kaist_mr(self):
+        """Write KAIST-format result.txt and compute Miss Rate metrics."""
+        result_file = self.save_dir / "result.txt"
+        with open(result_file, "w") as f:
+            for image_id, x, y, w, h, conf in self.kaist_results:
+                f.write(f"{image_id},{x:.4f},{y:.4f},{w:.4f},{h:.4f},{conf:.6f}\n")
+        LOGGER.info(f"KAIST result saved to {result_file} ({len(self.kaist_results)} detections)")
+
+        ann_file = Path(__file__).resolve().parents[4] / "evaluation_script" / "KAIST_annotation.json"
+        if not ann_file.is_file():
+            LOGGER.warning(f"KAIST annotation file not found: {ann_file}, skipping MR evaluation")
+            return
+
+        try:
+            import sys
+            eval_dir = str(Path(__file__).resolve().parents[4])
+            if eval_dir not in sys.path:
+                sys.path.insert(0, eval_dir)
+            from evaluation_script.evaluation_script import evaluate
+
+            MR = evaluate(str(ann_file), str(result_file), "Multispectral")
+            MR_all = MR["all"].summarize(0)
+            MR_day = MR["day"].summarize(0)
+            MR_night = MR["night"].summarize(0)
+            MR_near = MR["near"].summarize(1)
+            MR_medium = MR["medium"].summarize(2)
+            MR_far = MR["far"].summarize(3)
+            MR_none = MR["none"].summarize(4)
+            MR_partial = MR["partial"].summarize(5)
+            MR_heavy = MR["heavy"].summarize(6)
+            recall_all = 1 - MR["all"].eval["yy"][0][-1]
+
+            header = ("%12s" * 10) % (
+                "MR-all", "MR-day", "MR-night", "MR-near", "MR-medium",
+                "MR-far", "MR-none", "MR-part", "MR-heavy", "Recall",
+            )
+            values = ("%12.2f" * 10) % (
+                MR_all * 100, MR_day * 100, MR_night * 100, MR_near * 100, MR_medium * 100,
+                MR_far * 100, MR_none * 100, MR_partial * 100, MR_heavy * 100, recall_all * 100,
+            )
+            LOGGER.info(f"\n{header}\n{values}")
+            self.kaist_mr_all = MR_all
+        except Exception as e:
+            LOGGER.warning(f"KAIST MR evaluation failed: {e}")
 
     def _process_batch(self, detections, gt_bboxes, gt_cls):
         """
